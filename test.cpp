@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <chrono>
 #include <fstream>
 #include <iostream>
@@ -10,29 +11,26 @@
     { 1, 3, 224, 224 }
 #define INPUT_SHAPE_LEN 4
 
-float *read_input(const char *input_path) {
-    static float input_buf[INPUT_LEN];
+#define OUTPUT_LEN 1000
+#define OUTPUT_SHAPE                                                                               \
+    { 1, OUTPUT_LEN }
+#define OUTPUT_SHAPE_LEN 2
 
+// read the binary input from file
+std::array<float, INPUT_LEN> read_input(const char *input_path) {
+    auto input_buf = std::array<float, INPUT_LEN>();
     std::ifstream f(input_path, std::ios::in | std::ios::binary);
-    f.read(reinterpret_cast<char *>(input_buf), INPUT_LEN * sizeof(float));
+    f.read(reinterpret_cast<char *>(input_buf.begin()), INPUT_LEN * sizeof(float));
     return input_buf;
 }
 
-void post_process(const std::vector<Ort::Value> &output) {
-    if (output.size() != 1) {
-        std::cerr << "Run Fail! Output size = " << output.size() << std::endl;
-    }
-    if (!output[0].IsTensor()) {
-        std::cerr << "Run Fail Output is not tensor" << std::endl;
-    }
-    auto out_buf = reinterpret_cast<const float *>(output[0].GetTensorRawData());
-
+void post_process(const std::array<float, OUTPUT_LEN> &output) {
     // no softmax, just find max
     float max_value = std::numeric_limits<float>::min();
     int max_index = -1;
     for (int i = 0; i < 1000; ++i) {
-        if (out_buf[i] > max_value) {
-            max_value = out_buf[i];
+        if (output[i] > max_value) {
+            max_value = output[i];
             max_index = i;
         }
     }
@@ -45,11 +43,9 @@ int main(int argc, char *argv[]) {
                   << std::endl;
         return -1;
     }
-
     const ORTCHAR_T *model_path = argv[1];
-    float *input_data = read_input(argv[2]);
-    int64_t input_shape[] = INPUT_SHAPE;
 
+    // init api and create Session
     auto const &api = Ort::GetApi();
     auto session_options = Ort::SessionOptions();
 
@@ -66,25 +62,57 @@ int main(int argc, char *argv[]) {
         return -1;
     }
 
-    auto session = Ort::Session(Ort::Env(), model_path, session_options);
+    auto env = Ort::Env();
+    // env.UpdateEnvWithCustomLogLevel(ORT_LOGGING_LEVEL_VERBOSE);
+    auto session = Ort::Session(env, model_path, session_options);
     if (session.GetInputCount() != 1 || session.GetOutputCount() != 1) {
         std::cerr << "Unsupported Model" << std::endl;
     }
+
+    // prepare input and output
+    std::array<float, INPUT_LEN> input_data = read_input(argv[2]);
+    std::array<float, OUTPUT_LEN> output_data;
+    int64_t input_shape[] = INPUT_SHAPE;
+    int64_t output_shape[] = OUTPUT_SHAPE;
+    // input and output name
     auto cpu_mem_info = Ort::MemoryInfo::CreateCpu(OrtDeviceAllocator, OrtMemTypeDefault);
     auto allocator = Ort::Allocator(session, cpu_mem_info);
-    auto input =
-        Ort::Value::CreateTensor(cpu_mem_info, input_data, INPUT_LEN, input_shape, INPUT_SHAPE_LEN);
     auto input_name = session.GetInputNameAllocated(0, allocator);
     auto output_name = session.GetOutputNameAllocated(0, allocator);
     const char *const input_names[] = {&*input_name};
     const char *const output_names[] = {&*output_name};
+    // create tensor for input and output
+    auto input = Ort::Value::CreateTensor(cpu_mem_info, input_data.begin(), INPUT_LEN, input_shape,
+                                          INPUT_SHAPE_LEN);
+    auto output = Ort::Value::CreateTensor(cpu_mem_info, output_data.begin(), OUTPUT_LEN,
+                                           output_shape, OUTPUT_SHAPE_LEN);
 
-    auto start = std::chrono::system_clock::now();
-    auto output = session.Run(Ort::RunOptions(), input_names, &input, 1, output_names, 1);
-    auto end = std::chrono::system_clock::now();
-    auto e = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
-    std::cout << "Time = " << e / 1000 << "." << e % 1000 << " ms" << std::endl;
+    // run inference and record time.
+    const int test_run_num = 20;
+    static_assert(test_run_num > 2, "");
+    auto run_time = std::vector<int64_t>();
 
-    post_process(output);
+    for (auto i = 0; i < test_run_num; ++i) {
+        auto start = std::chrono::system_clock::now();
+        session.Run(Ort::RunOptions(), input_names, &input, 1, output_names, &output, 1);
+        auto end = std::chrono::system_clock::now();
+        auto e = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+        run_time.push_back(e);
+    }
+
+    std::cout << "Run inference " << test_run_num << " times." << std::endl;
+    std::sort(run_time.begin(), run_time.end());
+    std::cout << "Min time = " << run_time[0] / 1000 << "." << run_time[0] % 1000 << " ms"
+              << std::endl;
+    std::cout << "Max time = " << run_time.back() / 1000 << "." << run_time.back() % 1000 << " ms"
+              << std::endl;
+    auto sum = 0;
+    for (auto t : run_time) {
+        sum += t;
+    }
+    auto avg = double(sum - run_time[0] - run_time.back()) / (run_time.size() - 2);
+    std::cout << "Average time = " << avg / 1000.0 << " ms" << std::endl;
+
+    post_process(output_data);
     return 0;
 }
